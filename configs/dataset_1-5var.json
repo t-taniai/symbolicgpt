@@ -1,0 +1,29 @@
+{
+    "seed": 2021,
+    "numVars": [1,2,3,4,5],
+    "decimals": 8,
+    "numberofPoints": [10,200],
+    "numSamples": 10000,
+    "folder": "./Dataset",
+    "dataPath": "/{}_{}_{}.json",
+
+    "testPoints": false,
+    "trainRange": [-3.0,3.0],
+    "testRange": [[-5.0, 3.0],[-3.0, 5.0]],
+
+    "supportPoints": null,
+    "supportPointsTest": null,
+    "n_levels": 4,
+    "allow_constants": true,
+    "const_range": [-2.1, 2.1],
+    "const_ratio": 0.5,
+    "op_list": ["id", "add", "mul", "sin", "pow", "cos", "sqrt", "exp", "div", "sub", "log"],
+    "exponents": [3, 4, 5, 6],
+
+    "sortY": false,
+    "numSamplesEachEq": 50,
+    "threshold": 5000,
+    "force_threshold": true,
+    "templateProb": 0,
+    "templatesEQs": null
+}

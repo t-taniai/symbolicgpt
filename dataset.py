@@ -6,18 +6,143 @@ import os
 import json
 import numpy as np
 from tqdm import tqdm
-import multiprocessing as mp
+from joblib import Parallel, delayed
 from datetime import datetime
 from generator.treeBased.generateData import dataGen
-from utils import * # TODO: replace with a safer import
+import argparse
+import random
+import warnings
+from distutils.util import strtobool
+import json
 
-def processData(numSamples, nv, decimals, 
+def generateXYDataFromEquation(eq, n_points=2, n_vars=3, decimals=4, supportPoints=None, min_x=0, max_x=3):
+    # Do not use the safe wrapper functions in utils.py
+    # so that invalid eq producing NaN will be rejected.
+    ref_dict = {
+        'sin': np.sin,
+        'cos': np.cos,
+        'log': np.log,
+        'exp': np.exp,
+        'abs': np.abs,
+        'sqrt': np.sqrt,
+        'arcsin': np.arcsin,
+        'arccos': np.arccos,
+        'divide': np.divide,
+    }
+    
+    if supportPoints is None:
+        if isinstance(min_x, list):
+            # when x-range is a union of intervals,
+            # uniformly sample from this union using gumbel sampling.
+            # For example, when interval1 = [0,1) and interval2 = [50,100),
+            # then x is x50 more frequently sampled from interval2.
+
+            # log-probability to select each interval
+            logp = np.array([ma-mi for mi,ma in zip(min_x, max_x)])[None]
+            logp = np.log(logp/logp.sum())
+            x = []
+            for _ in range(n_vars):
+                # make random values for each interval
+                r = [np.random.uniform(mi, ma, n_points) for mi,ma in zip(min_x, max_x)]
+                r = np.stack(r, -1)
+
+                # gumbel sampling
+                g = -np.log(-np.log(np.random.uniform(size=r.shape)))
+                ind = np.argmax(logp + g, 1)
+                s = np.take_along_axis(r, ind[:,None], 1)
+                x.append(s.reshape(-1))
+
+            x = np.stack(x, -1)
+            x = np.round(x, decimals)
+        else:
+            x = np.round(np.random.uniform(min_x, max_x, (n_points, n_vars)), decimals)
+    else:
+        x = np.array(supportPoints, dtype=np.float64)
+
+    ref_dict.update({f'x{i+1}': x[:, i] for i in range(n_vars)})
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore')
+        y = np.round(eval(eq, ref_dict), decimals)
+        
+        # Case of "eq = C".
+        if np.isscalar(y):
+            y = np.full(n_points, y, dtype=y.dtype)
+
+    return x, y
+
+'''
+This function samples an equation f(x) from a skeleton and 
+computes y=f(x) for variables x sampled from the specififed range.
+It returns (x, y, equation) if y is valid (eg, no inf nor nan).
+Otherwise it returns (None, None, None).
+'''
+def generateEquationDatasetFromSkeleton(
+    skeletonEqn,
+    nv,
+    const_range,
+    xRange,
+    numberofPoints,
+    supportPoints,
+    decimals,
+    threshold,
+    force_threshold,
+    maxTrials,
+    ):
+    numC = skeletonEqn.count('C')
+    for _ in range(maxTrials):
+        # replace the constants with randam values
+        Cs = np.random.uniform(const_range[0], const_range[1], size=numC)
+        # replace: C -> ({}), Ce+5 -> ({}e+5)
+        cleanEqn = re.sub(r'C(e[+-]\d+)?', r'({}\1)', skeletonEqn)
+        cleanEqn = cleanEqn.format(*tuple(Cs.tolist()))
+
+        # generate a set of points
+        nPoints = np.random.randint(*numberofPoints) \
+            if supportPoints is None else len(supportPoints)
+
+        try:
+            x, y = generateXYDataFromEquation(cleanEqn, n_points=nPoints, n_vars=nv,
+                                    decimals=decimals, supportPoints=supportPoints, 
+                                    min_x=xRange[0], max_x=xRange[1])
+        
+        except KeyboardInterrupt as e:
+            raise e
+        except Exception as e:
+            # retry
+            continue
+
+        if np.isnan(y).any() or np.isinf(y).any(): # TODO: Later find a more optimized solution
+            # retry
+            # print('nan inf retry: ', cleanEqn)
+            continue
+
+        # replace out of threshold with maximum numbers
+        if force_threshold and threshold > 0:
+            y = np.clip(y, -threshold, threshold)
+
+        elif not force_threshold and threshold > 0:
+            if (abs(y) > threshold).any():
+                # print('threshold retry: ', cleanEqn)
+                continue
+
+        if len(y) == 0: # if for whatever reason the y is empty
+            print('Empty y, x: {}, most of the time this is because of wrong numberofPoints: {}'.format(x, numberofPoints))
+            # retry
+            continue
+
+        return x.tolist(), y.tolist(), cleanEqn
+        
+    return None, None, None
+
+def processData(seed, numSamples, nv, decimals, 
                 template, dataPath, fileID, time, 
                 supportPoints=None, 
                 supportPointsTest=None,
                 numberofPoints=[20,250],
-                xRange=[0.1,3.1], testPoints=False,
-                testRange=[0.0,6.0], n_levels = 3,
+                xRange=[0.1,3.1], 
+                testPoints=False,
+                testRange=[0.0,6.0], 
+                n_levels=3,
                 allow_constants=True, 
                 const_range=[-0.4, 0.4],
                 const_ratio=0.8,
@@ -25,347 +150,231 @@ def processData(numSamples, nv, decimals,
                     "id", "add", "mul", "div", 
                     "sqrt", "sin", "exp", "log"],
                 sortY=False,
-                exponents= [3,4,5,6],
+                exponents=[3,4,5,6],
                 numSamplesEachEq=1,
-                threshold = 100,
+                threshold=100,
+                force_threshold=True,
                 templatesEQs=None,
                 templateProb=0.4,
                 ):
 
-    for i in tqdm(range(numSamples)):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    sampleCount = 0
+    for i in tqdm(range(numSamples*numSamplesEachEq)):
         structure = template.copy()
-        # generate a formula
-        # Create a new random equation
-        try:
-            _, skeletonEqn, _ = dataGen( 
-                                        nv = nv, decimals = decimals, 
-                                        numberofPoints=numberofPoints, 
-                                        supportPoints=supportPoints,
-                                        supportPointsTest=supportPointsTest,
-                                        xRange=xRange,
-                                        testPoints=testPoints,
-                                        testRange=testRange,
-                                        n_levels=n_levels,
-                                        op_list=op_list,
-                                        allow_constants=allow_constants, 
-                                        const_range=const_range,
-                                        const_ratio=const_ratio,
-                                        exponents=exponents
-                                    )
-            if templatesEQs != None and np.random.rand() < templateProb: 
-                # by a chance, replace the skeletonEqn with a given templates
-                idx = np.random.randint(len(templatesEQs[nv]))
-                skeletonEqn = templatesEQs[nv][idx]
 
-        except Exception as e:
-            # Handle any exceptions that timing might raise here
-            print("\n-->dataGen(.) was terminated!\n{}\n".format(e))
-            i = i-1
-            continue
+        # At each iteration, we make sure an equation instance is generated from a skeleton. 
+        # If we fail to make an equation with a skeleton, we refresh the skeleton and repeat
+        # the iteration without incrementing i. The same skeleton is repeatedly reused 
+        # (numSamplesEachEq times) unless it shows issues such as nan and inf.
+        succsess = False
+        while not succsess:
+            # generate a new skeleton if we created numSamplesEachEq of equation samples from the previous skeleton.
+            if sampleCount % numSamplesEachEq == 0:
+                sampleCount = 0
+                try:
+                    _, skeletonEqn, _ = dataGen(
+                        nv=nv, 
+                        decimals=decimals, 
+                        numberofPoints=numberofPoints, 
+                        supportPoints=supportPoints,
+                        supportPointsTest=supportPointsTest,
+                        xRange=xRange,
+                        testPoints=testPoints,
+                        testRange=testRange,
+                        n_levels=n_levels,
+                        op_list=op_list,
+                        allow_constants=allow_constants, 
+                        const_range=const_range,
+                        const_ratio=const_ratio,
+                        exponents=exponents
+                        )
+                    if templatesEQs != None and np.random.rand() < templateProb: 
+                        # by a chance, replace the skeletonEqn with a given templates
+                        idx = np.random.randint(len(templatesEQs[nv]))
+                        skeletonEqn = templatesEQs[nv][idx]
 
-        # fix exponents that are larger than our expected value, sometimes the data generator generates those odd numbers
-        exps = re.findall(r"(\*\*[0-9\.]+)", skeletonEqn)
-        for ex in exps:
-            # correct the exponent
-            cexp = '**'+str(eval(ex[2:]) if eval(ex[2:]) < exponents[-1] else np.random.randint(2,exponents[-1]+1))
-            # replace the exponent
-            skeletonEqn = skeletonEqn.replace(ex, cexp)     
+                except KeyboardInterrupt as e:
+                    raise e
+                except Exception as e:
+                    # retry to generate another skeleton
+                    print("\n-->dataGen(.) was terminated!\n{}\n".format(e))
+                    continue
 
-        for e in range(numSamplesEachEq):
-            # replace the constants with new ones
-            cleanEqn = ''
-            for chr in skeletonEqn:
-                if chr == 'C':
-                    # genereate a new random number
-                    chr = '{}'.format(np.random.uniform(const_range[0], const_range[1]))
-                cleanEqn += chr
-
-            if 'I' in cleanEqn or 'zoo' in cleanEqn:
-                # repeat the equation generation
-                print('This equation has been rejected: {}'.format(cleanEqn))
-                i -= 1 #TODO: this might lead to a bad loop
-                break
-
-            # generate new data points
-            nPoints = np.random.randint(
-                    *numberofPoints) if supportPoints is None else len(supportPoints)
-
-            try:
-                data = generateDataStrEq(cleanEqn, n_points=nPoints, n_vars=nv,
-                                         decimals=decimals, supportPoints=supportPoints, min_x=xRange[0], max_x=xRange[1])
-            except: 
-                # for different reason this might happend including but not limited to division by zero
-                continue
-            # if testPoints:
-            #     dataTest = generateDataStrEq(currEqn, n_points=numberofPoints, n_vars=nv, decimals=decimals,
-            #                                  supportPoints=supportPointsTest, min_x=testRange[0], max_x=testRange[1]))   
-
-            # use the new x and y
-            x,y = data
-
-            # check if there is nan/inf/very large numbers in the y
-            if np.isnan(y).any() or np.isinf(y).any(): # TODO: Later find a more optimized solution
-                # repeat the data generation
-                #i -= 1 #TODO: this might lead to a bad loop
-                #break
-                e -= 1
-                continue
+                if 'I' in skeletonEqn or 'zoo' in skeletonEqn:
+                    # retry to generate another skeleton
+                    print('Skeleton rejected: {}'.format(skeletonEqn))
+                    continue
                 
-            # replace out of threshold with maximum numbers
-            y = [e if abs(e)<threshold else np.sign(e) * threshold for e in y]
+                # fix exponents that are larger than our expected value, sometimes the data generator generates those odd numbers
+                exps = re.findall(r"(\*\*[0-9\.]+)", skeletonEqn)
+                for ex in exps:
+                    # correct the exponent
+                    cexp = '**'+str(eval(ex[2:]) if eval(ex[2:]) < exponents[-1] else np.random.randint(2,exponents[-1]+1))
+                    # replace the exponent
+                    skeletonEqn = skeletonEqn.replace(ex, cexp)
 
-            if len(y) == 0: # if for whatever reason the y is empty
-                print('Empty y, x: {}, most of the time this is because of wrong numberofPoints: {}'.format(x, numberofPoints))
-                e -= 1
+            eq_params = (nv, const_range, xRange, numberofPoints, supportPoints, decimals, threshold, force_threshold)
+            x, y, cleanEqn = generateEquationDatasetFromSkeleton(skeletonEqn, *eq_params, maxTrials=10)
+            
+            if x is None:
+                print('Failed to make valid equations. Skeleton rejected: {}'.format(skeletonEqn))
+                    # refresh the invalid skeleton and retry the iteration.
+                sampleCount = 0
                 continue
-
-            # just make sure there is no samples out of the threshold
-            if abs(min(y)) > threshold or abs(max(y)) > threshold:
-                raise 'Err: Min:{},Max:{},Threshold:{}, \n Y:{} \n Eq:{}'.format(min(y), max(y), threshold, y, cleanEqn)
 
             # sort data based on Y
             if sortY:
-                x,y = zip(*sorted(zip(x,y), key=lambda d: d[1]))
-            
+                x, y = zip(*sorted(zip(x,y), key=lambda d: d[1]))
+
             # hold data in the structure
-            structure['X'] = list(x)
+            structure['X'] = x
             structure['Y'] = y
-            structure['Skeleton'] = skeletonEqn
             structure['EQ'] = cleanEqn
+            structure['Skeleton'] = skeletonEqn
+
+            if testPoints:
+                eq_params = (nv, const_range, testRange, numberofPoints, \
+                    supportPointsTest, decimals, threshold, force_threshold)
+                xT, yT, _ = generateEquationDatasetFromSkeleton(cleanEqn, *eq_params, maxTrials=10)
+
+                if xT is None:
+                    print('Failed to make valid test equations. Skeleton rejected: {}'.format(skeletonEqn))
+                    # refresh the invalid skeleton and retry the iteration.
+                    sampleCount = 0
+                    continue
+
+                if sortY:
+                    xT, yT = zip(*sorted(zip(xT,yT), key=lambda d: d[1]))
+                structure['XT'] = xT
+                structure['YT'] = yT
 
             outputPath = dataPath.format(fileID, nv, time)
             if os.path.exists(outputPath):
                 fileSize = os.path.getsize(outputPath)
-                if fileSize > 500000000: # 500 MB
-                    fileID +=1 
+                if fileSize > 500000000:  # 500 MB
+                    fileID += 1
+
             with open(outputPath, "a", encoding="utf-8") as h:
                 json.dump(structure, h, ensure_ascii=False)
                 h.write('\n')
 
+            # successfully created an equation instance.
+            sampleCount += 1
+            succsess = True
+
+
 def main():
-    # Config
-    seed = 2021 # 2021 Train, 2022 Val, 2023 Test, you have to change the generateData.py seed as well
-    #from GenerateData import seed
-    import random
-    random.seed(seed)
-    np.random.seed(seed=seed) # fix the seed for reproducibility
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default="", required=True, type=str, help="json file for setting-up default params")
+    parser.add_argument('--seed', default=2021, type=int, help="")
+    parser.add_argument('--numVars', nargs="+", default=[1,2,3,4,5,6,7,8,9], type=int, help="")
+    parser.add_argument('--numberofPoints', nargs="+", default=[20, 250], type=int, help="")
+    parser.add_argument('--numSamples', default=10000, type=int, help="")
+    parser.add_argument('--testPoints', default=False, type=strtobool, help="")
+    parser.add_argument('--folder', default='./Dataset', type=str, help="")
+    parser.add_argument('--const_range', nargs="+", default=[-2.1, 2.1], type=float, help="")
+    parser.add_argument('--numSamplesEachEq', default=5, type=int, help="")
+    parser.add_argument('--threshold', default=5000, type=int, help="")
+    parser.add_argument('--force_threshold', default=True, type=strtobool, help="")
+    parser.add_argument('--parallel', action='store_true', help="")
+
+    # load the json config and use it as default values.
+    args = parser.parse_args()
+    with open(args.config, 'r') as file:
+        config = json.load(file)
+    default_values = {key: config[key] for key in vars(args) if key in config}
+    parser.set_defaults(**default_values)
+
+    # parse the args again with the defaults specified by config
+    args = parser.parse_args()
+    for key in vars(args):
+        config[key] = getattr(args, key)
+    print(config)
 
     #NOTE: For linux you can only use unique numVars, in Windows, it is possible to use [1,2,3,4] * 10!
-    numVars = list(range(1,10)) #[1,2,3,4,5]
-    decimals = 4
-    numberofPoints = [20,250] # only usable if support points has not been provided
-    numSamples = 10000 # number of generated samples
-    folder = './Dataset'
-    dataPath = folder +'/{}_{}_{}.json'
+    numVars = config['numVars']
+    decimals = config['decimals']
+    numberofPoints = config['numberofPoints']
+    numSamples = config['numSamples']
+    folder = config['folder']
+    dataPath = os.path.join(folder, '{}_{}_{}.json')
 
-    testPoints = False
-    trainRange = [-3.0,3.0] 
-    testRange = [[-5.0, 3.0],[-3.0, 5.0]] # this means Union((-5,-1),(1,5))
+    testPoints = config['testPoints']
+    trainRange = config['trainRange']
+    testRange = config['testRange']
 
-    supportPoints = None
-    #supportPoints = np.linspace(xRange[0],xRange[1],numberofPoints[1])
-    #supportPoints = [[np.round(p,decimals)] for p in supportPoints]
-    #supportPoints = [[np.round(p,decimals), np.round(p,decimals)] for p in supportPoints]
-    #supportPoints = [[np.round(p,decimals) for i in range(numVars[0])] for p in supportPoints]
+    supportPoints = config['supportPoints']
+    supportPointsTest = config['supportPointsTest']
+    n_levels = config['n_levels']
+    allow_constants = config['allow_constants']
+    const_range = config['const_range']
+    const_ratio = config['const_ratio']
+    op_list = config['op_list']
+    exponents = config['exponents']
 
-    supportPointsTest = None
-    #supportPoints = None # uncomment this line if you don't want to use support points
-    #supportPointsTest = np.linspace(xRange[0],xRange[1],numberofPoints[1])
-    #supportPointsTest = [[np.round(p,decimals) for i in range(numVars[0])] for p in supportPointsTest]
+    sortY = config['sortY']
+    numSamplesEachEq = config['numSamplesEachEq']
+    threshold = config['threshold']
+    force_threshold = config['force_threshold']
+    templateProb = config['templateProb'] # the probability of generating an equation from the templates
+    templatesEQs = config['templatesEQs']
     
-    n_levels = 4
-    allow_constants = True
-    const_range = [-2.1, 2.1]
-    const_ratio = 0.5
-    op_list=[
-                "id", "add", "mul",
-                "sin", "pow", "cos", "sqrt",
-                "exp", "div", "sub", "log",
-                "arcsin",
-            ]
-    exponents=[3, 4, 5, 6]
-
-    sortY = False # if the data is sorted based on y
-    numSamplesEachEq = 5
-    threshold = 5000
-    templateProb = 0.1 # the probability of generating an equation from the templates
-    templatesEQs = None # template equations, if NONE then there will be no specific templates for the generated equations
-    templatesEQs = {
-        1: [
-            # NGUYEN
-            'C*x1**3+C*x1**2+C*x1+C', 
-            'C*x1**4+C*x1**3+C*x1**2+C*x1+C',
-            'C*x1**5+C*x1**4+C*x1**3+C*x1**2+C*x1+C',
-            'C*x1**6+C*x1**5+C*x1**4+C*x1**3+C*x1**2+C*x1+C',
-            'C*sin(C*x1**2)*cos(C*x1+C)+C',
-            'C*sin(C*x1+C)+C*sin(C*x1+C*x1**2)+C',
-            'C*log(C*x1+C)+C*log(C*x1**2+C)+C',
-            'C*sqrt(C*x1+C)+C',
-            ],
-        2: [
-            # NGUYEN
-            'C*sin(C*x1+C)+C*sin(C*x2**2+C)+C',
-            'C*sin(C*x1+C)*cos(C*x2+C)+C',
-            'C*x1**x2+C',
-            'C*x1**4+C*x1**3+C*x2**2+C*x2+C',
-            # # AI Faynman
-            # 'C*exp(C*x1**2+C)/sqrt(C*x2+C)+C',
-            # 'C*x1*x2+C',
-            # 'C*1/2*x1*x2**2+C',
-            # 'C*x1/x2+C',
-            # 'C*arcsin(C*x1*sin(C*x2+C)+C)+C',
-            # 'C*(C*x1/(2*pi)+C)*x2+C',
-            # 'C*3/2*x1*x2+C',
-            # 'C*x1/(C*4*pi*x2**2+C)+C',
-            # 'C*x1*x2**2/2+C',
-            # 'C*1+C*x1*x2/(C*1-C*(C*x1*x2/3+C)+C)+C',
-            # 'C*x1*x2**2+C',
-            # 'C*x1/(2*(1+C*x2+C))+C',
-            # 'C*x1*(C*x2/(2*pi)+C)+C',
-            ], 
-        # 3: [
-        #     # AI Faynman
-        #     'C*exp(C*(x1/x2)**2)/(C*sqrt(2*x3)*x2+C)+C',
-        #     'C*x1/sqrt(1-x2**2/x3**2+C)+C',
-        #     'C*x1*x2*x3+C',
-        #     'C*x1*x2/sqrt(C*1-C*x2**2/x3**2+C)+C',
-        #     'C*(C*x1+C*x2+C)/(C*1+C*x1*x2/x3**2+C)+C',
-        #     'C*x1*x3*sin(C*x2+C)+C',
-        #     'C*1/(C*1/x1+C*x2/x3+C)+C',
-        #     'C*x1*sin(C*x2*x3/2+C)**2/sin(x3/2)**2+C',
-        #     'C*arcsin(C*x1/(C*x2*x3+C)+C)+C',
-        #     'C*x1/(C*1-C*x2/x3+C)+C',
-        #     'C*(1+C*x1/x3+C)/sqrt(1-C*x1**2/x3**2+C)*x2+C',
-        #     'C*(C*x1/(C*x3+C)+C)*x2+C',
-        #     'C*x1+C*x2+C*2*sqrt(x1*x2)*cos(x3)+C',
-        #     'C*1/(x1-1)*x2*x3+C',
-        #     'C*x1*x2*x3+C',
-        #     'C*sqrt(x1*x2/x3)+C',
-        #     'C*x1*x2**2/sqrt(C*1-C*x3**2/x2**2+C)+C',
-        #     'C*x1/(C*4*pi*x2*x3+C)+C',
-        #     'C*1/(C*4*pi*x1+C)*x4*cos(C*x2+C)/x3**2+C',
-        #     'C*3/5*x1**2/(C*4*pi*x2*x3+C)+C',
-        #     'C*x1/x2*1/(1+x3)+C',
-        #     'C*x1/sqrt(C*1-C*x2**2/x3**2+C)+C',
-        #     'C*x1*x2/sqrt(C*1-C*x2**2/x3**2+C)+C',
-        #     '-C*x1*x3*COS(C*x2+C)+C',
-        #     '-C*x1*x2*COS(C*x3+C)+C',
-        #     'C*sqrt(C*x1**2/x2**2-C*pi**2/x3**2+C)+C',
-        #     'C*x1*x2*x3**2+C',
-        #     'C*x1*x2/(C*2*pi*x3+C)+C',
-        #     'C*x1*x2*x3/2+C',
-        #     'C*x1*x2/(4*pi*x3)+C',
-        #     'C*x1*(1+C*x2+C)*x3+C',
-        #     'C*2*x1*x2/(C*x3/(2*pi)+C)+C',
-        #     'C*sin(C*x1*x2/(C*x3/(2*pi)+C)+C)**2+C',
-        #     'C*2*x1*(1-C*cos(C*x2*x3+C)+C)+C',
-        #     'C*(C*x1/(2*pi)+C)**2/(C*2*x2*x3**2+C)+C',
-        #     'C*2*pi*x3/(C*x1*x2+C)+C',
-        #     'C*x1*(1+C*x2*cos(x3)+C)+C',
-        # ], 
-        # 4: [
-        #     # AI Faynman
-        #     'C*exp(C*((C*x1+C*x2+C)/x3)**2+C)/(C*sqrt(C*x4+C)*x3+C)+C', 
-        #     'C*sqrt(C*(C*x2+C*x1+C)**2+(C*x3+C*x4+C)**2+C)+C',    
-        #     'C*x1*x2/(C*x3*x4*x2**3+C)+C',
-        #     'C/2*x1*(C*x2**2+C*x3**2+C*x4**2+C)+C',
-        #     'C*(C*x1-C*x2*x3+C)/sqrt(C*1-C*x2**2/x4**2+C)+C',
-        #     'C*(C*x1-C*x3*x2/x4**2+C)/sqrt(C*1-C*x3**2/x4**2+C)+C',
-        #     'C*(C*x1*x3+C*x2*x4+C)/(C*x1+C*x2+C)+C',
-        #     'C*x1*x2*x3*sin(C*x4+C)+C',
-        #     'C*1/2*x1*(C*x3**2+C*x4**2+C)*1/2*x2**2+C',
-        #     'C*sqrt(C*x1**2+C*x2**2-C*2*x1*x2*cos(C*x3-C*x4+C))+C',
-        #     'C*x1*x2*x3/x4+C',
-        #     'C*4*pi*x1*(C*x2/(2*pi)+C)**2/(C*x3*x4**2+C)+C',
-        #     'C*x1*x2*x3/x4+C',
-        #     'C*1/(C*x1-1+C)*x2*x3/x4+C',
-        #     'C*x1*(C*cos(C*x2*x3+C)+C*x4*cos(C*x2*x3+C)**2+C)+C',
-        #     'C*x1/(C*4*pi*x2+C)*3*cos(C*x3+C)*sin(C*x3+C)/x4**3+C',
-        #     'C*x1*x2/(C*x3*(C*x4**2-x5**2+C)+C)+C',
-        #     'C*x1*x2/(C*1-C*(C*x1*x2/3+C)+C)*x3*x4+C',
-        #     'C*1/(C*4*pi*x1*x2**2+C)*2*x3/x4+C',
-        #     'C*x1*x2*x3/(2*x4)+C',
-        #     'C*x1*x2*x3/x4+C',
-        #     'C*1/(C*exp(C*(C*x1/(2*pi)+C)*x4/(C*x2*x3+C)+C)-1)+C',
-        #     'C*(x1/(2*pi))*x2/(C*exp(C*(C*x1/(2*pi)+C)*x2/(C*x3*x4+C))-1)+C',
-        #     'C*x1*sqrt(C*x2**2+C*x3**2+C*x4**2+C)+C',
-        #     'C*2*x1*x2**2*x3/(C*x4/(2*pi)+C)+C',
-        #     'C*x1*(C*exp(C*x3*x2/(C*x4*x5+C)+C)-1)+C',
-        #     '-C*x1*x2*x3/x4+C',
-        # ], 
-        # 5: [
-        #     # AI Faynman
-        #     'C*x1*x2*x3/(C*x4*x5*x3**3+C)+C',  
-        #     'C*x1*(C*x2+C*x3*x4*sin(C*x5+C))+C',     
-        #     'C*x1*x2*x3*(C*1/x4-C*1/x5+C)+C',  
-        #     'C*x1/(2*pi)*x2**3/(pi**2*x5**2*(exp((x1/(2*pi))*x2/(x3*x4))-1))+C',   
-        #     'C*x1*x2*x3*ln(x4/x5)+C',
-        #     'C*x1*(C*x2-C*x3+C)*x4/x5+C',
-        #     'C*x1*x2**2*x3/(C*3*x4*x5+C)+C',
-        #     'C*x1/(C*4*pi*x2*x3*(1-C*x4/x5+C)+C)+C',
-        #     'C*x1*x2*x3*x4/(C*x5/(2*pi)+C)+C',
-        #     'C*x1/(C*exp(C*x2*x3/(C*x4*x5+C)+C)+C*exp(-C*x2*x3/(C*x4*x5+C)))+C',
-        #     'C*x1*x2*tanh(C*x2*x3/(C*x4*x5+C)+C)+C',
-        #     '-C*x1*x3**4/(C*2*(C*4*pi*x2+C)**2*(C*x4/(2*pi)+C)**2)*(C*1/x5**2+C)',
-        # ], 
-        # 6: [
-        #     # AI Faynman
-        #     'C*x1*x4+C*x2*x5+C*x3*x6+C', 
-        #     'C*x1**2*x2**2/(C*6*x3*x4*x5**3+C)+C',     
-        #     'C*x1*exp(-C*x2*x3*x4/(C*x5*x6+C))+C',      
-        #     'C*x1/(C*4*pi*x2+C)*3*x5/x6**5*sqrt(C*x3**2+x4**2+C)+C',
-        #     'C*x1*(1+C*x2*x3*cos(C*x4+C)/(C*x5*x6+C)+C)+C',
-        #     'C*(C*x1*x5*x4/(C*x6/(2*pi)+C)+C)*sin(C*(C*x2-C*x3+C)*x4/2)**2/(C*(C*x2-C*x3+C)*x4/2)**2+C',
-        # ], 
-        # 7: [
-        #     # AI Faynman
-        #     'C*(C*1/2*x1*x4*x5**2+C)*(C*8*x6*x7**2/3+C)*(C*x2**4/(C*x2**2-C*x3**2+C)**2+C)+C',
-            
-        # ], 
-        # 8: [
-        #     # AI Faynman
-        #     'C*x1*x8/(C*x4*x5+C)+C*(C*x1*x2+C)/(C*x3*x7**2*x4*x5+C)*x6+C',            
-        # ], 
-        # 9: [
-        #     # AI Faynman
-        #     'C*x3*x4*x5/((C*x2+C*x1+C)**2+(C*x6+C*x7+C)**2+(C*x8+C*x9)**2+C)+C',
-        # ], 
-    }
-
-    print(os.mkdir(folder) if not os.path.isdir(folder) else 'We do have the path already!')
+    print(os.makedirs(folder) if not os.path.isdir(folder) \
+        else 'We do have the path already!')
 
     template = {'X':[], 'Y':0.0, 'EQ':''}
     fileID = 0
-    #mp.set_start_method('spawn')
-    #q = mp.Queue()
-    processes = []
-    for i, nv in enumerate(numVars):
-        now = datetime.now()
-        time = '{}_'.format(i) + now.strftime("%d%m%Y_%H%M%S")
-        print('Processing equations with {} variables!'.format(nv))
+    now = datetime.now()
 
-        p = mp.Process(target=processData, 
-                       args=(
-                                numSamples, nv, decimals, template, 
-                                dataPath, fileID, time, supportPoints, 
-                                supportPointsTest,
-                                numberofPoints,
-                                trainRange, testPoints, testRange, n_levels, 
-                                allow_constants, const_range,
-                                const_ratio, op_list, sortY, exponents,
-                                numSamplesEachEq,
-                                threshold,
-                                templatesEQs,
-                                templateProb
-                            )
-                       )
-        p.start()
-        processes.append(p)
-    
-    for p in processes:
-        p.join()
+    # For reproducibility, set the seed for the main thread
+    # and then set a modified seed inside each thread.
+    seed = config['seed']
+    random.seed(seed)
+    np.random.seed(seed)
+
+    if args.parallel:
+        Parallel(n_jobs=len(numVars))(
+            delayed(processData)(
+                seed*100+i,
+                numSamples, nv, decimals, template, 
+                dataPath, fileID,
+                '{}_'.format(i) + now.strftime("%d%m%Y_%H%M%S"),
+                supportPoints, 
+                supportPointsTest,
+                numberofPoints,
+                trainRange, testPoints, testRange, n_levels, 
+                allow_constants, const_range,
+                const_ratio, op_list, sortY, exponents,
+                numSamplesEachEq,
+                threshold,
+                force_threshold,
+                templatesEQs,
+                templateProb
+            ) for i,nv in enumerate(numVars)
+        )
+    else:
+        # TODO: workaround for avoiding freezing when running by threads 
+        for i,nv in enumerate(numVars):
+            processData(
+                seed*100+i,
+                numSamples, nv, decimals, template, 
+                dataPath, fileID,
+                '{}_'.format(i) + now.strftime("%d%m%Y_%H%M%S"),
+                supportPoints, 
+                supportPointsTest,
+                numberofPoints,
+                trainRange, testPoints, testRange, n_levels, 
+                allow_constants, const_range,
+                const_ratio, op_list, sortY, exponents,
+                numSamplesEachEq,
+                threshold,
+                force_threshold,
+                templatesEQs,
+                templateProb
+            )
 
 if __name__ == '__main__':
     main()
-
-
