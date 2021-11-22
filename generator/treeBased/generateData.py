@@ -462,10 +462,15 @@ def simplify_formula(formula_to_simplify, digits=4):
     try:
         for a in traversed:
             if isinstance(a, sympy.Float):
+                # reject an equation containing large constants.
+                if np.abs(a) > 1e5:
+                    return None
                 if digits is not None:
                     if np.abs(a) < 10**(-1 * digits):
                         rounded = rounded.subs(a, 0)
-                    else:
+                    else:       
+                        # the code of round(a, digits) freezes when
+                        # a is extremely large.
                         rounded = rounded.subs(a, round(a, digits))
                 elif np.abs(a) < big_eps:
                     rounded = rounded.subs(a, 0)
@@ -561,10 +566,10 @@ def dataGen(nv, decimals,
                                       const_ratio=const_ratio,
                                       exponents=exponents)
 
-    cleanEqn = eqn_to_str(currEqn, n_vars=nv,
-                          decimals=decimals)
+    cleanEqn = eqn_to_str(currEqn, n_vars=nv, decimals=decimals)
     # skeletonEqn = eqn_to_str_skeleton_structure(
     # currEqn, n_vars=nv, decimals=decimals)
+
     skeletonEqn = eqn_to_str_skeleton(cleanEqn)
     # data = create_dataset_from_raw_eqn(currEqn, n_points=nPoints, n_vars=nv,
     #                                    decimals=decimals, supportPoints=supportPoints, min_x=xRange[0], max_x=xRange[1])

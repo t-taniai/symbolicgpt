@@ -8,7 +8,7 @@ python dataset.py \
     --testPoints 1 \
     --numSamplesEachEq 1 \
     --force_threshold 0 \
-    --numSamples 200
+    --numSamples 200 \
 
 python dataset.py \
     --config ./configs/dataset_1-5var.json \
@@ -40,7 +40,7 @@ python dataset.py \
     --testPoints 1 \
     --numSamplesEachEq 1 \
     --force_threshold 0 \
-    --numSamples 200
+    --numSamples 1000
 
 python dataset.py \
     --config ./configs/dataset_1var.json \
@@ -49,7 +49,7 @@ python dataset.py \
     --testPoints 1 \
     --numSamplesEachEq 1 \
     --force_threshold 0 \
-    --numSamples 200
+    --numSamples 1000
 
 python dataset.py \
     --config ./configs/dataset_1var.json \
@@ -67,7 +67,7 @@ python dataset.py \
     --testPoints 1 \
     --numSamplesEachEq 1 \
     --force_threshold 0 \
-    --numSamples 200
+    --numSamples 500
 
 python dataset.py \
     --config ./configs/dataset_2var.json \
@@ -76,7 +76,7 @@ python dataset.py \
     --testPoints 1 \
     --numSamplesEachEq 1 \
     --force_threshold 0 \
-    --numSamples 200
+    --numSamples 500
 
 python dataset.py \
     --config ./configs/dataset_2var.json \
@@ -94,7 +94,7 @@ python dataset.py \
     --testPoints 1 \
     --numSamplesEachEq 1 \
     --force_threshold 0 \
-    --numSamples 200
+    --numSamples 333
 
 python dataset.py \
     --config ./configs/dataset_3var.json \
@@ -103,7 +103,7 @@ python dataset.py \
     --testPoints 1 \
     --numSamplesEachEq 1 \
     --force_threshold 0 \
-    --numSamples 200
+    --numSamples 333
 
 python dataset.py \
     --config ./configs/dataset_3var.json \

@@ -2,7 +2,7 @@
     "seed": 2021,
     "numVars": [1,2,3,4,5],
     "decimals": 8,
-    "numberofPoints": [10,200],
+    "numPoints": [10,200],
     "numSamples": 10000,
     "folder": "./Dataset",
     "dataPath": "/{}_{}_{}.json",

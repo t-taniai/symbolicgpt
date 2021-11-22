@@ -269,17 +269,16 @@ def processData(seed, numSamples, nv, decimals,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default="", required=True, type=str, help="json file for setting-up default params")
-    parser.add_argument('--seed', default=2021, type=int, help="")
-    parser.add_argument('--numVars', nargs="+", default=[1,2,3,4,5,6,7,8,9], type=int, help="")
-    parser.add_argument('--numberofPoints', nargs="+", default=[20, 250], type=int, help="")
-    parser.add_argument('--numSamples', default=10000, type=int, help="")
-    parser.add_argument('--testPoints', default=False, type=strtobool, help="")
-    parser.add_argument('--folder', default='./Dataset', type=str, help="")
-    parser.add_argument('--const_range', nargs="+", default=[-2.1, 2.1], type=float, help="")
-    parser.add_argument('--numSamplesEachEq', default=5, type=int, help="")
-    parser.add_argument('--threshold', default=5000, type=int, help="")
-    parser.add_argument('--force_threshold', default=True, type=strtobool, help="")
-    parser.add_argument('--parallel', action='store_true', help="")
+    parser.add_argument('--seed', default=2021, type=int, help="the random seed")
+    parser.add_argument('--numVars', nargs="+", default=[1,2,3,4,5,6,7,8,9], type=int, help="the maximum number of variables in an equation")
+    parser.add_argument('--numSamples', default=10000, type=int, help="the number of skeletons to generate")
+    parser.add_argument('--numSamplesEachEq', default=5, type=int, help="the number of equations produced from a skeleton")
+    parser.add_argument('--numPoints', nargs="+", default=[20, 250], type=int, help="the range of data point numbers")
+    parser.add_argument('--testPoints', default=False, type=strtobool, help="whether or not generate test data points")
+    parser.add_argument('--folder', default='./Dataset', type=str, help="the saving directory")
+    parser.add_argument('--const_range', nargs="+", default=[-2.1, 2.1], type=float, help="the range of constant values")
+    parser.add_argument('--threshold', default=5000, type=int, help="checks whether abs(y) <= threshold is satisfied")
+    parser.add_argument('--force_threshold', default=True, type=strtobool, help="force abs(y) <= threshold (if False, reject vaiolating eqs)")
 
     # load the json config and use it as default values.
     args = parser.parse_args()
@@ -292,12 +291,13 @@ def main():
     args = parser.parse_args()
     for key in vars(args):
         config[key] = getattr(args, key)
-    print(config)
+    for key in config:
+        print(f'{key}: {config[key]}')
 
     #NOTE: For linux you can only use unique numVars, in Windows, it is possible to use [1,2,3,4] * 10!
     numVars = config['numVars']
     decimals = config['decimals']
-    numberofPoints = config['numberofPoints']
+    numPoints = config['numPoints']
     numSamples = config['numSamples']
     folder = config['folder']
     dataPath = os.path.join(folder, '{}_{}_{}.json')
@@ -329,52 +329,32 @@ def main():
     fileID = 0
     now = datetime.now()
 
-    # For reproducibility, set the seed for the main thread
-    # and then set a modified seed inside each thread.
+    # Reproducibility note: random seed settings are independent 
+    # by different threads. So, we set the seed for the main thread,
+    # and then set modified seeds for individual runs of processData.
     seed = config['seed']
     random.seed(seed)
     np.random.seed(seed)
 
-    if args.parallel:
-        Parallel(n_jobs=len(numVars))(
-            delayed(processData)(
-                seed*100+i,
-                numSamples, nv, decimals, template, 
-                dataPath, fileID,
-                '{}_'.format(i) + now.strftime("%d%m%Y_%H%M%S"),
-                supportPoints, 
-                supportPointsTest,
-                numberofPoints,
-                trainRange, testPoints, testRange, n_levels, 
-                allow_constants, const_range,
-                const_ratio, op_list, sortY, exponents,
-                numSamplesEachEq,
-                threshold,
-                force_threshold,
-                templatesEQs,
-                templateProb
-            ) for i,nv in enumerate(numVars)
-        )
-    else:
-        # TODO: workaround for avoiding freezing when running by threads 
-        for i,nv in enumerate(numVars):
-            processData(
-                seed*100+i,
-                numSamples, nv, decimals, template, 
-                dataPath, fileID,
-                '{}_'.format(i) + now.strftime("%d%m%Y_%H%M%S"),
-                supportPoints, 
-                supportPointsTest,
-                numberofPoints,
-                trainRange, testPoints, testRange, n_levels, 
-                allow_constants, const_range,
-                const_ratio, op_list, sortY, exponents,
-                numSamplesEachEq,
-                threshold,
-                force_threshold,
-                templatesEQs,
-                templateProb
-            )
+    Parallel(n_jobs=-1)(
+        delayed(processData)(
+            seed*100+i,
+            numSamples, nv, decimals, template, 
+            dataPath, fileID,
+            '{}_'.format(i) + now.strftime("%d%m%Y_%H%M%S"),
+            supportPoints, 
+            supportPointsTest,
+            numPoints,
+            trainRange, testPoints, testRange, n_levels, 
+            allow_constants, const_range,
+            const_ratio, op_list, sortY, exponents,
+            numSamplesEachEq,
+            threshold,
+            force_threshold,
+            templatesEQs,
+            templateProb
+        ) for i,nv in enumerate(numVars)
+    )
 
 if __name__ == '__main__':
     main()
