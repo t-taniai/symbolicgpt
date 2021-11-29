@@ -8,7 +8,7 @@ python dataset.py \
     --testPoints 1 \
     --numSamplesEachEq 1 \
     --force_threshold 0 \
-    --numSamples 200 \
+    --numSamples 200
 
 python dataset.py \
     --config ./configs/dataset_1-5var.json \
@@ -19,17 +19,14 @@ python dataset.py \
     --force_threshold 0 \
     --numSamples 200
 
-# Note: Original settings (numSamples=10000,numSamplesEachEq=50) should produce
-# 2,500,000 samples (10000*50*5) but due to bugs the actual number was 2,262,058.
-# Now we make 2,000,000 samples.
 python dataset.py \
     --config ./configs/dataset_1-5var.json \
     --folder ./datasets/1-5Var_v2/Train/ \
     --seed 2021 \
     --testPoints 0 \
-    --numSamplesEachEq 20 \
+    --numSamplesEachEq 50 \
     --force_threshold 1 \
-    --numSamples 20000
+    --numSamples 10000
 
 
 # ------------------- 1 Var -------------------

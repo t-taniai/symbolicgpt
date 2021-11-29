@@ -193,8 +193,8 @@ def processData(seed, numSamples, nv, decimals,
                         )
                     if templatesEQs != None and np.random.rand() < templateProb: 
                         # by a chance, replace the skeletonEqn with a given templates
-                        idx = np.random.randint(len(templatesEQs[nv]))
-                        skeletonEqn = templatesEQs[nv][idx]
+                        idx = np.random.randint(len(templatesEQs[str(nv)]))
+                        skeletonEqn = templatesEQs[str(nv)][idx]
 
                 except KeyboardInterrupt as e:
                     raise e

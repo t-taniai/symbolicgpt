@@ -265,6 +265,11 @@ def raw_eqn_to_str(raw_eqn, n_vars=2):
             return "{:.3f}".format(np.sin(left_value))
         return "sin({})".format(left_side)
 
+    if current_op == 'asin':
+        if left_is_float:
+            return "{:.3f}".format(np.sin(left_value))
+        return "asin({})".format(left_side)
+
     if current_op == 'pow':
         # exponent = exponents[np.random.randint(len(exponents))]
         if left_is_float:
@@ -377,6 +382,11 @@ def raw_eqn_to_skeleton_structure(raw_eqn, n_vars=2):
         if left_is_float:
             return "C*sin(C)"
         return "sin({})".format(left_side)
+
+    if current_op == 'asin':
+        if left_is_float:
+            return "C*asin(C)"
+        return "asin({})".format(left_side)
 
     if current_op == 'pow':
         # exponent = exponents[np.random.randint(len(exponents))]
@@ -501,10 +511,12 @@ def eqn_to_str_skeleton(eq):
         '(+': '(',
         'sin(': 'sin(C*',
         'cos(': 'cos(C*',
+        'asin(': 'asin(C*',
         'log(': 'log(C*',
         'exp(': 'exp(C*',
         'sqrt(': 'sqrt(C*',
         'sin': 'C*sin',
+        'asin': 'C*asin',
         'cos': 'C*cos',
         'log': 'C*log',
         'exp': 'C*exp',
