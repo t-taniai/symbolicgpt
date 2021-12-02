@@ -1,15 +1,17 @@
+from functools import partial
 import re
 import json
 import random
 import torch
 import numpy as np
-import torch.nn as nn
-from tqdm import tqdm
 from scipy.optimize import minimize
-from torch.utils.data import Dataset
 from torch.nn import functional as F
 from numpy import * # to override the math functions
 from matplotlib import pyplot as plt
+from tqdm import tqdm
+import math
+import warnings
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -86,7 +88,7 @@ def top_k_top_p_filtering(logits, top_k=0.0, top_p=0.0, filter_value=-float('Inf
     return logits
 
 @torch.no_grad()
-def sample_from_model(model, x, steps, points=None, variables=None, temperature=1.0, sample=False, top_k=0.0, top_p=0.0):
+def sample_from_model(model, x, steps, points=None, index=None, variables=None, temperature=1.0, sample=False, top_k=0.0, top_p=0.0, is_finished=None):
     """
     take a conditioning sequence of indices in x (of shape (b,t)) and predict the next token in
     the sequence, feeding the predictions back into the model each time. Clearly the sampling
@@ -96,8 +98,11 @@ def sample_from_model(model, x, steps, points=None, variables=None, temperature=
     block_size = model.get_block_size()
     model.eval()
     for k in range(steps):
+        if is_finished is not None and is_finished(x):
+            break
+
         x_cond = x if x.size(1) <= block_size else x[:, -block_size:] # crop context if needed
-        logits, _ = model(x_cond, points=points, variables=variables)
+        logits, _ = model(x_cond, points=points, index=index, variables=variables)
         # pluck the logits at the final step and scale by temperature
         logits = logits[0, -1, :] / temperature
         # optionally crop probabilities to only the top k options
@@ -333,268 +338,287 @@ def exp(x, eps=1e-5):
     return np.exp(x)
 
 # Mean square error
-def mse(y, y_hat):
-    y_hat = np.reshape(y_hat, [1, -1])[0]
-    y_gold = np.reshape(y, [1, -1])[0]
-    our_sum = 0
-    for i in range(len(y_gold)):
-        our_sum += (y_hat[i] - y_gold[i]) ** 2
-
-    return our_sum / len(y_gold)
-
-# Relative Mean Square Error
-def relativeErr(y, yHat, info=False, eps=1e-5):
-    yHat = np.reshape(yHat, [1, -1])[0]
-    y = np.reshape(y, [1, -1])[0]
+def mse(y, yHat):
+    y = y.reshape(-1)
+    yHat = yHat.reshape(-1)
     if len(y) > 0 and len(y)==len(yHat):
-        err = ( (yHat - y) )** 2 / np.linalg.norm(y+eps)
-        if info:
-            for _ in range(5):
-                i = np.random.randint(len(y))
-                print('yPR,yTrue:{},{}, Err:{}'.format(yHat[i],y[i],err[i]))
+        err = np.mean((yHat - y)**2)
     else:
-        err = 100
+        err = float('inf')
 
-    return np.mean(err)
-
-class CharDataset(Dataset):
-    def __init__(self, data, block_size, chars, 
-                 numVars, numYs, numPoints, target='EQ', 
-                 addVars=False, const_range=[-0.4, 0.4],
-                 xRange=[-3.0,3.0], decimals=4, augment=False):
-
-        data_size, vocab_size = len(data), len(chars)
-        print('data has %d examples, %d unique.' % (data_size, vocab_size))
-        
-        self.stoi = { ch:i for i,ch in enumerate(chars) }
-        self.itos = { i:ch for i,ch in enumerate(chars) }
-
-        self.numVars = numVars
-        self.numYs = numYs
-        self.numPoints = numPoints
-        
-        # padding token
-        self.paddingToken = '_'
-        self.paddingID = self.stoi[self.paddingToken]
-        self.stoi[self.paddingToken] = self.paddingID
-        self.itos[self.paddingID] = self.paddingToken
-        self.threshold = [-1000,1000]
-        
-        self.block_size = block_size
-        self.vocab_size = vocab_size
-        self.data = data # it should be a list of examples
-        self.target = target
-        self.addVars = addVars
-
-        self.const_range = const_range
-        self.xRange = xRange
-        self.decimals = decimals
-        self.augment = augment
-    
-    def __len__(self):
-        return len(self.data)-1
-
-    def __getitem__(self, idx):
-        # grab an example from the data
-        chunk = self.data[idx] # sequence of tokens including x, y, eq, etc.
-        
-        try:
-            chunk = json.loads(chunk) # convert the sequence tokens to a dictionary
-        except Exception as e:
-            print("Couldn't convert to json: {} \n error is: {}".format(chunk, e))
-            # try the previous example
-            idx = idx - 1 
-            idx = idx if idx>=0 else 0
-            chunk = self.data[idx]
-            chunk = json.loads(chunk) # convert the sequence tokens to a dictionary
-            
-        # find the number of variables in the equation
-        printInfoCondition = random.random() < 0.0000001
-        eq = chunk[self.target]
-        if printInfoCondition:
-            print(f'\nEquation: {eq}')
-        vars = re.finditer('x[\d]+',eq) 
-        numVars = 0
-        for v in vars:
-            v = v.group(0).strip('x')
-            v = eval(v)
-            v = int(v)
-            if v > numVars:
-                numVars = v
-
-        if self.target == 'Skeleton' and self.augment:
-            threshold = 5000
-            # randomly generate the constants
-            cleanEqn = ''
-            for chr in eq:
-                if chr == 'C':
-                    # genereate a new random number
-                    chr = '{}'.format(np.random.uniform(self.const_range[0], self.const_range[1]))
-                cleanEqn += chr
-
-            # update the points
-            nPoints = np.random.randint(*self.numPoints) #if supportPoints is None else len(supportPoints)
-            try:
-                if printInfoCondition:
-                    print('Org:',chunk['X'], chunk['Y'])
-
-                X, y = generateDataStrEq(cleanEqn, n_points=nPoints, n_vars=self.numVars,
-                                         decimals=self.decimals, min_x=self.xRange[0], 
-                                         max_x=self.xRange[1])
-
-                # replace out of threshold with maximum numbers
-                y = [e if abs(e)<threshold else np.sign(e) * threshold for e in y]
-
-                # check if there is nan/inf/very large numbers in the y
-                conditions = (np.isnan(y).any() or np.isinf(y).any()) or len(y) == 0 or (abs(min(y)) > threshold or abs(max(y)) > threshold)
-                if not conditions:
-                    chunk['X'], chunk['Y'] = X, y
-
-                if printInfoCondition:
-                    print('Evd:',chunk['X'], chunk['Y'])
-            except Exception as e: 
-                # for different reason this might happend including but not limited to division by zero
-                print("".join([
-                    f"We just used the original equation and support points because of {e}. ",
-                    f"The equation is {eq}, and we update the equation to {cleanEqn}",
-                ]))
- 
-        # encode every character in the equation to an integer
-        # < is SOS, > is EOS
-        if self.addVars:
-            dix = [self.stoi[s] for s in '<'+str(numVars)+':'+eq+'>']
-        else:
-            dix = [self.stoi[s] for s in '<'+eq+'>']
-        inputs = dix[:-1]
-        outputs = dix[1:]
-        
-        # add the padding to the equations
-        paddingSize = max(self.block_size-len(inputs),0)
-        paddingList = [self.paddingID]*paddingSize
-        inputs += paddingList
-        outputs += paddingList
-        
-        # make sure it is not more than what should be
-        inputs = inputs[:self.block_size]
-        outputs = outputs[:self.block_size]
-        
-        # extract points from the input sequence
-        # maxX = max(chunk['X'])
-        # maxY = max(chunk['Y'])
-        # minX = min(chunk['X'])
-        # minY = min(chunk['Y'])
-        points = torch.zeros(self.numVars+self.numYs, self.numPoints[1]-1)
-        for idx, xy in enumerate(zip(chunk['X'], chunk['Y'])):
-
-            # don't let to exceed the maximum number of points
-            if idx >= self.numPoints[1]-1:
-                break
-            
-            x = xy[0]
-            #x = [(e-minX[eID])/(maxX[eID]-minX[eID]+eps) for eID, e in enumerate(x)] # normalize x
-            x = x + [0]*(max(self.numVars-len(x),0)) # padding
-
-            y = [xy[1]] if type(xy[1])==float or type(xy[1])==np.float64 else xy[1]
-
-            #y = [(e-minY)/(maxY-minY+eps) for e in y]
-            y = y + [0]*(max(self.numYs-len(y),0)) # padding
-            p = x+y # because it is only one point 
-            p = torch.tensor(p)
-            #replace nan and inf
-            p = torch.nan_to_num(p, nan=self.threshold[1], 
-                                 posinf=self.threshold[1], 
-                                 neginf=self.threshold[0])
-            # p[p>self.threshold[1]] = self.threshold[1] # clip the upper bound
-            # p[p<self.threshold[0]] = self.threshold[0] # clip the lower bound
-            points[:,idx] = p
-
-        # Normalize points between zero and one # DxN
-        # minP = points.min(dim=1, keepdim=True)[0]
-        # maxP = points.max(dim=1, keepdim=True)[0]
-        # points -= minP
-        # points /= (maxP-minP+eps)
-        # if printInfoCondition:
-        #     print(f'Points: {points}')
-
-        # points -= points.mean()
-        # points /= points.std()
-        points = torch.nan_to_num(points, nan=self.threshold[1],
-                                 posinf=self.threshold[1],
-                                 neginf=self.threshold[0])
-
-        # if printInfoCondition:
-        #     print(f'Points: {points}')
-        #points += torch.normal(0, 0.05, size=points.shape) # add a guassian noise
-        
-        inputs = torch.tensor(inputs, dtype=torch.long)
-        outputs = torch.tensor(outputs, dtype=torch.long)
-        numVars = torch.tensor(numVars, dtype=torch.long)
-        return inputs, outputs, points, numVars
-
-def processDataFiles(files):
-    text = ""
-    for f in tqdm(files):
-        with open(f, 'r') as h: 
-            lines = h.read() # don't worry we won't run out of file handles
-            if lines[-1]==-1:
-                lines = lines[:-1]
-            #text += lines #json.loads(line)    
-            text = ''.join([lines,text])    
-    return text
-
-def lossFunc(constants, eq, X, Y, eps=1e-5):
-    err = 0
-    eq = eq.replace('C','{}').format(*constants)
-
-    for x,y in zip(X,Y):
-        eqTemp = eq + ''
-        if type(x) == np.float32:
-            x = [x]
-        for i,e in enumerate(x):
-            # make sure e is not a tensor
-            if type(e) == torch.Tensor:
-                e = e.item()
-            eqTemp = eqTemp.replace('x{}'.format(i+1), str(e))
-        try:
-            yHat = eval(eqTemp)
-        except:
-            print('Exception has been occured! EQ: {}, OR: {}'.format(eqTemp, eq))
-            continue
-            yHat = 100
-        try:
-            # handle overflow
-            err += relativeErr(y, yHat) #(y-yHat)**2
-        except:
-            print('Exception has been occured! EQ: {}, OR: {}, y:{}-yHat:{}'.format(eqTemp, eq, y, yHat))
-            continue
-            err += 10
-        
-    err /= len(Y)
     return err
 
-def generateDataStrEq(eq, n_points=2, n_vars=3,
-                      decimals=4, supportPoints=None, 
-                      min_x=0, max_x=3):
-    X = []
-    Y= []
-    # TODO: Need to make this faster
-    for p in range(n_points):
-        if supportPoints is None:
-            if type(min_x) == list:
-                x = []
-                for _ in range(n_vars):
-                    idx = np.random.randint(len(min_x))
-                    x += list(np.round(np.random.uniform(min_x[idx], max_x[idx], 1), decimals))
-            else:
-                x = list(np.round(np.random.uniform(min_x, max_x, n_vars), decimals))
-            assert len(x)!=0, "For some reason, we didn't generate the points correctly!"
-        else:
-            x = supportPoints[p]
+# Relative Mean Square Error
+def relativeErr(y, yHat, eps=1e-5):
+    y, yHat = y.reshape(-1), yHat.reshape(-1)
+    if len(y) > 0 and len(y)==len(yHat):
+        err = ((yHat - y)**2).mean() / (np.linalg.norm(y)+eps)
+    else:
+        err = float('inf')
 
-        tmpEq = eq + ''
-        for nVID in range(n_vars):
-            tmpEq = tmpEq.replace('x{}'.format(nVID+1), str(x[nVID]))
-        y = float(np.round(eval(tmpEq), decimals))
-        X.append(x)
-        Y.append(y)
-    return X, Y
+    return err
+
+def normScaledMSE(y, yHat, eps=1e-5):
+    y, yHat = y.reshape(-1), yHat.reshape(-1)
+    if len(y) > 0 and len(y)==len(yHat):
+        err = sum((yHat - y)**2) / (sum(y**2)+eps)
+    else:
+        err = float('inf')
+
+    return err
+
+def varScaledMSE(y, yHat, eps=1e-5):
+    y, yHat = y.reshape(-1), yHat.reshape(-1)
+    if len(y) > 0 and len(y)==len(yHat):
+        err = sum((yHat - y)**2) / (sum((y-y.mean())**2)+eps)
+    else:
+        err = float('inf')
+
+    return err
+
+
+def lossFunc(constants, eq, X, Y, errorFunc=relativeErr, imagPenalty=0):
+    yHat = evalFunc(eq, X, constants, allowComplex=imagPenalty>0)
+    err = errorFunc(Y, yHat)
+    if imagPenalty > 0:
+        err = np.real(err) + imagPenalty*np.imag(err)
+    return err
+
+def replaceConstantsByNumbered(eq):
+    eq = eq.replace('C', '{}').format(*(f'C{i+1}' for i in range(eq.count('C'))))
+    eq = eq.replace('D', '{}').format(*(f'D{i+1}' for i in range(eq.count('D'))))
+    eq = eq.replace('F', '{}').format(*(f'F{i+1}' for i in range(eq.count('F'))))
+    return eq
+
+
+def substituteConstants(constants, eq):
+    eq = eq + ''
+    num_C = eq.count('C')
+    num_F = eq.count('F')
+    num_D = eq.count('D')
+    C = constants[:num_C]
+    D = constants[num_C:num_C+num_D]
+    F = constants[num_C+num_D:num_C+num_D+num_F]
+    if len(C) > 0:
+        eq = re.sub('C[0-9]?', '({})', eq).format(*C)
+    if len(D) > 0:
+        D = [10.0**d for d in D]
+        eq = re.sub('D[0-9]?', '({})', eq).format(*D)
+    if len(F) > 0:
+        F = [exp(f) for f in F]
+        eq = re.sub('F[0-9]?', '({})', eq).format(*F)
+    return eq
+
+def evalFunc(eq, X, c=None, verbose=False, allowComplex=False):
+    # make dicts for eval func.
+    # transpose X as it its shape is (L, dim).
+    cp = 0j if allowComplex else 0
+    var_dict = {f'x{i+1}':(x+cp) for i,x in enumerate(X.T)}
+    myabs = lambda x: np.abs(np.real(x))+1j*np.abs(np.imag(x))
+    fun_dict = {
+        'sin': np.sin,
+        'cos': np.cos,
+        'log': np.log if allowComplex else log,
+        'exp': np.exp if allowComplex else exp,
+        'abs': myabs if allowComplex else np.abs,
+        'sqrt': np.sqrt if allowComplex else sqrt,
+        'arcsin': np.arcsin,
+        'arccos': np.arccos,
+        'divide': divide,
+    }
+    if c is not None and len(c)>0:
+        num_C = eq.count('C')
+        num_F = eq.count('F')
+        num_D = eq.count('D')
+        
+        var_dict.update({f'C{i+1}':v+cp for i,v in enumerate(c[:num_C])})
+        var_dict.update({f'D{i+1}':10**v+cp for i,v in enumerate(c[num_C:num_C+num_D])})
+        var_dict.update({f'F{i+1}':exp(v)+cp for i,v in enumerate(c[num_C+num_D:num_C+num_D+num_F])})
+
+    try:
+        yHat = eval(eq, var_dict, fun_dict)
+        # broadcast yHat if it is a single constant (ie, eq=C).
+        if np.isscalar(yHat):
+            yHat = np.full((X.shape[0], 1), yHat, dtype=X.dtype)
+
+    except Exception as e:
+        if verbose:
+            print('Exception has been occured! EQ: {}'.format(eq))
+        yHat = np.full((X.shape[0], 1), 1e5, dtype=X.dtype)
+    return yHat
+
+
+def generateXYDataFromEquation(eq, n_points=2, n_vars=3, decimals=4, supportPoints=None, min_x=0, max_x=3):
+    # Do not use the safe wrapper functions in utils.py
+    # so that invalid eq producing NaN will be rejected.
+    ref_dict = {
+        'sin': np.sin,
+        'cos': np.cos,
+        'log': np.log,
+        'exp': np.exp,
+        'abs': np.abs,
+        'sqrt': np.sqrt,
+        'arcsin': np.arcsin,
+        'arccos': np.arccos,
+        'divide': np.divide,
+    }
+    
+    if supportPoints is None:
+        if isinstance(min_x, list):
+            # when x-range is a union of intervals,
+            # uniformly sample from this union using gumbel sampling.
+            # For example, when interval1 = [0,1) and interval2 = [50,100),
+            # then x is x50 more frequently sampled from interval2.
+
+            # log-probability to select each interval
+            logp = np.array([ma-mi for mi,ma in zip(min_x, max_x)])[None]
+            logp = np.log(logp/logp.sum())
+            x = []
+            for _ in range(n_vars):
+                # make random values for each interval
+                r = [np.random.uniform(mi, ma, n_points) for mi,ma in zip(min_x, max_x)]
+                r = np.stack(r, -1)
+
+                # gumbel sampling
+                g = -np.log(-np.log(np.random.uniform(size=r.shape)))
+                ind = np.argmax(logp + g, 1)
+                s = np.take_along_axis(r, ind[:,None], 1)
+                x.append(s.reshape(-1))
+
+            x = np.stack(x, -1)
+            x = np.round(x, decimals)
+        else:
+            x = np.round(np.random.uniform(min_x, max_x, (n_points, n_vars)), decimals)
+    else:
+        x = np.array(supportPoints, dtype=np.float64)
+
+    ref_dict.update({f'x{i+1}': x[:, i] for i in range(n_vars)})
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore')
+        y = np.round(eval(eq, ref_dict), decimals)
+        
+        # Case of "eq = C".
+        if np.isscalar(y):
+            y = np.full(n_points, y, dtype=y.dtype)
+
+    return x, y
+
+
+def evaluate(model, loader, device, printer=None, errorFunc=relativeErr, verbose=False):
+    model.eval()
+    variableEmbedding = model.pointNetConfig.varibleEmbedding
+    dataset = loader.dataset
+    end_token_id = dataset.stoi.get('>')
+    is_finished = lambda x: (x[:,-1]==end_token_id).all()
+
+    results = []
+    pbar = tqdm(enumerate(loader), total=len(loader))
+    for i, batch in pbar:
+        inputs,outputs,points,index,variables = batch
+
+        t = dataset.data[i]
+        X = np.array(t['X'], dtype=np.float64)
+        Y = np.array(t['Y'], dtype=np.float64)
+        XT = np.array(t['XT'], dtype=np.float64)
+
+        inputs = inputs[:,0:1].to(device)
+        points = points.to(device)
+        index = index.to(device)
+        variables = variables.to(device)
+
+        outputsHat = sample_from_model(
+                    model, 
+                    inputs, 
+                    dataset.block_size, 
+                    points=points,
+                    index=index,
+                    variables=variables,
+                    temperature=1.0, 
+                    sample=True, 
+                    top_k=0.0,
+                    top_p=0.7,
+                    is_finished=is_finished)[0]
+
+        # filter out predicted
+        target = t['EQ']
+        predicted = [dataset.itos[int(i)] for i in outputsHat]
+
+        predicted = ''.join(predicted)
+        if variableEmbedding == 'STR_VAR':
+            #target = target.split(':')[-1]
+            predicted = predicted.split(':')[-1]
+
+        predicted = predicted.strip(dataset.paddingToken).split('>')
+        predicted = predicted[0]
+        predicted = predicted.strip('<').strip(">")
+
+        # replace C, D, F with C1, D1, F1...
+        predicted = replaceConstantsByNumbered(predicted)
+
+        target = target.replace(' ','').replace('\n','')
+        predicted = predicted.replace(' ','').replace('\n','')
+        
+        # train a regressor to find the constants (too slow)
+        c = [1.0 for i,x in enumerate(predicted) if x=='C'] # initialize coefficients as 1
+        c += [0.0 for i,x in enumerate(predicted) if x=='D']    # D: 10**x
+        c += [0.0 for i,x in enumerate(predicted) if x=='F']    # F: exp(x)
+
+        # c[-1] = 0 # initialize the constant as zero
+        b = [(-2,2) for i,x in enumerate(predicted) if x=='C']  # bounds on variables
+        b += [(0,32) for i,x in enumerate(predicted) if x=='D']  # bounds on variables
+        b += [(-10,10) for i,x in enumerate(predicted) if x=='F']  # bounds on variables
+        try:
+            _lossFunc = partial(lossFunc, errorFunc=errorFunc)
+            if len(c) != 0:
+                cHat = minimize(_lossFunc, c, #bounds=b,
+                            args=(predicted, X, Y)) 
+                c = cHat.x
+        except ValueError:
+            raise 'Err: Wrong Equation {}'.format(predicted)
+        except Exception as e:
+            raise 'Err: Wrong Equation {}, Err: {}'.format(predicted, e)
+
+        YT = evalFunc(target, XT)
+        YThat = evalFunc(predicted, XT, c, verbose=verbose)
+        err = errorFunc(YT, YThat)
+
+        if type(err) is np.complex128 or complex:
+            err = abs(err.real)
+        
+        newResult = {
+            'index': i,
+            'error': err,
+            'target': target,
+            'pred_sk': predicted,
+            'pred_eq': substituteConstants(c, predicted)
+        }
+        results.append(newResult)
+        if printer is not None:
+            printer(newResult)
+        
+    return results
+
+def calc_area_under_curve_score(scores, lb=1e-5, ub=1e+5, bins=1000):
+    '''
+    Compute a normalized cumulative histogram of log of scores and
+    calculate the area under the curve (1: best, 0: worst).
+    '''
+    scores = torch.clamp(torch.tensor(scores), lb, ub)
+    scores = torch.log10(scores)
+    h = torch.histc(scores, bins, math.log10(lb), math.log10(ub)) / scores.numel()
+    h = torch.cumsum(h, 0)
+    return h.mean().item()
+
+def calc_area_above_curve_score(scores, lb=1e-5, ub=1e+5, bins=1000):
+    '''
+    Compute a normalized cumulative histogram of log of scores and
+    calculate the area above the curve (1: worst, 0: best).
+    '''
+    return 1 - calc_area_under_curve_score(scores, lb, ub, bins)
+
+def validation_tester(model, loader, device, errorFunc=relativeErr):
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore')
+        results = evaluate(model, loader, device, errorFunc=errorFunc)
+        scores = [x['error'] for x in results]
+    return calc_area_above_curve_score(scores)

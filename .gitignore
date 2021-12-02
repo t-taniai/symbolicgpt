@@ -15,3 +15,5 @@
 benchmarkSimilarEquations.json
 **/benchmark/*
 **/datasets/*
+**/results/*
+**/.cache/*

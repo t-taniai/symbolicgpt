@@ -5,6 +5,7 @@ so nothing in this file really has anything to do with GPT specifically.
 
 import math
 import logging
+import os
 
 from tqdm import tqdm
 import numpy as np
@@ -13,6 +14,8 @@ import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.dataloader import DataLoader
+from utils import evaluate
+import warnings
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +29,12 @@ class TrainerConfig:
     weight_decay = 0.1 # only applied on matmul weights
     # learning rate decay params: linear warmup followed by cosine decay to 10% of original
     lr_decay = False
-    warmup_tokens = 375e6 # these two numbers come from the GPT-3 paper, but may not be good defaults elsewhere
-    final_tokens = 260e9 # (at what point we reach 10% of original LR)
+    warmup_samples = 375e6 # these two numbers come from the GPT-3 paper, but may not be good defaults elsewhere
+    final_samples = 260e9 # (at what point we reach 10% of original LR)
     # checkpoint settings
     ckpt_path = None
     num_workers = 0 # for DataLoader
+    save_every_epoch = True
 
     def __init__(self, **kwargs):
         for k,v in kwargs.items():
@@ -38,26 +42,29 @@ class TrainerConfig:
 
 class Trainer:
 
-    def __init__(self, model, train_dataset, test_dataset, config, best=None, device='gpu'):
+    def __init__(self, model, train_dataset, test_dataset, config, device='gpu', collate_fn=None, tester=None):
         self.model = model
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
+        self.collate_fn = collate_fn
         self.config = config
+        self.tester = tester
 
         # take over whatever gpus are on the system
         self.device = 'cpu'
-        if device == 'gpu' and torch.cuda.is_available():
+        if device in ('cuda','gpu') and torch.cuda.is_available():
             self.device = torch.cuda.current_device()
             self.model = torch.nn.DataParallel(self.model).to(self.device)
             print('We are using the gpu now! device={}'.format(self.device))
 
-        self.best_loss = best
+        self.best_loss = None
 
-    def save_checkpoint(self):
+    def save_checkpoint(self, name):
         # DataParallel wrappers keep raw model object in .module attribute
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        logger.info("saving %s", self.config.ckpt_path)
-        torch.save(raw_model.state_dict(), self.config.ckpt_path)
+        file = os.path.join(self.config.ckpt_path, name)
+        logger.info("saving %s", file)
+        torch.save(raw_model.state_dict(), file)
 
     def train(self):
         model, config = self.model, self.config
@@ -68,23 +75,26 @@ class Trainer:
             is_train = split == 'train'
             model.train(is_train)
             data = self.train_dataset if is_train else self.test_dataset
-            loader = DataLoader(data, shuffle=True, pin_memory=True,
+            loader = DataLoader(data, shuffle=is_train, pin_memory=True,
                                 batch_size=config.batch_size,
-                                num_workers=config.num_workers)
+                                collate_fn=self.collate_fn,
+                                num_workers=config.num_workers,
+                                drop_last=is_train)
 
             losses = []
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
-            for it, (x, y, p, v) in pbar:
+            for it, (x, y, p, ind, v) in pbar:
 
                 # place data on the correct device
                 x = x.to(self.device) # input equation
                 y = y.to(self.device) # output equation
-                p = p.to(self.device) # points
                 v = v.to(self.device) # number of variables
+                p = p.to(self.device) # points with indices
+                ind = ind.to(self.device)
 
                 # forward the model
                 with torch.set_grad_enabled(is_train):
-                    logits, loss = model(x, y, p, v, tokenizer=self.train_dataset.itos)
+                    logits, loss = model(x, y, p, ind, v, tokenizer=self.train_dataset.itos)
                     loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
                     losses.append(loss.item())
 
@@ -98,13 +108,13 @@ class Trainer:
 
                     # decay the learning rate based on our progress
                     if config.lr_decay:
-                        self.tokens += (y >= 0).sum() # number of tokens processed this step (i.e. label is not -100)
-                        if self.tokens < config.warmup_tokens:
+                        self.samples += y.shape[0] # number of samples processed this step
+                        if self.samples < config.warmup_samples:
                             # linear warmup
-                            lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
+                            lr_mult = float(self.samples) / float(max(1, config.warmup_samples))
                         else:
                             # cosine learning rate decay
-                            progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
+                            progress = float(self.samples - config.warmup_samples) / float(max(1, config.final_samples - config.warmup_samples))
                             lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
                         lr = config.learning_rate * lr_mult
                         for param_group in optimizer.param_groups:
@@ -121,15 +131,28 @@ class Trainer:
                 return test_loss
 
         self.best_loss = float('inf') if self.best_loss is None else self.best_loss
-        self.tokens = 0 # counter used for learning rate decay
+        self.samples = 0 # counter used for learning rate decay
         for epoch in range(config.max_epochs):
 
             run_epoch('train')
+            self.save_checkpoint('latest.pt')
+            if self.config.save_every_epoch:
+                self.save_checkpoint(f'epoch{epoch+1:03d}.pt')
+
             if self.test_dataset is not None:
-                test_loss = run_epoch('test')
+                if self.tester is not None:
+                    loader = DataLoader(self.test_dataset, shuffle=False, pin_memory=True,
+                                        batch_size=1,
+                                        collate_fn=self.collate_fn,
+                                        num_workers=self.config.num_workers,
+                                        drop_last=False)
+                    test_loss = self.tester(raw_model, loader, self.device)
+                else:
+                    test_loss = run_epoch('test')
+                logger.info("test loss: %f", test_loss)
 
             # supports early stopping based on the test loss, or just save always if no test set is provided
             good_model = self.test_dataset is None or test_loss < self.best_loss
             if self.config.ckpt_path is not None and good_model:
                 self.best_loss = test_loss
-                self.save_checkpoint()
+                self.save_checkpoint('best.pt')

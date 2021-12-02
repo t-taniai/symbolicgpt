@@ -1,0 +1,18 @@
+{
+    "numEpochs": 20,
+    "embeddingSize": 512,
+    "numPoints": [500,501],
+    "numVars": 3,
+    "numYs": 1,
+    "blockSize": 200,
+    "batchSize": 128,
+    "target": "Skeleton",
+    "const_range": [-2.1, 2.1],
+    "decimals": 8,
+    "trainRange": [-3.0,3.0],
+    "dataDir": "./datasets/",
+    "dataFolder": "3Var_v2",
+    "addr": "./results/",
+    "condMethod": "EMB_SUM", 
+    "varEmb": "NOT_VAR"
+}

@@ -15,6 +15,12 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+try:
+    from torch_scatter import scatter_max
+    is_scatter_available = True
+except:
+    is_scatter_available = False
+
 logger = logging.getLogger(__name__)
 
 class GPTConfig:
@@ -186,11 +192,11 @@ class tNet(nn.Module):
         self.activation_func = F.relu
         self.num_units = config.embeddingSize
 
-        self.conv1 = nn.Conv1d(config.numberofVars+config.numberofYs, self.num_units, 1)
-        self.conv2 = nn.Conv1d(self.num_units, 2 * self.num_units, 1)
-        self.conv3 = nn.Conv1d(2 * self.num_units, 4 * self.num_units, 1)
-        self.fc1 = nn.Linear(4 * self.num_units, 2 * self.num_units)
-        self.fc2 = nn.Linear(2 * self.num_units, self.num_units)
+        self.lin1 = nn.Linear(config.numberofVars+config.numberofYs, self.num_units, bias=False)
+        self.lin2 = nn.Linear(self.num_units, 2 * self.num_units, bias=False)
+        self.lin3 = nn.Linear(2 * self.num_units, 4 * self.num_units, bias=False)
+        self.fc1 = nn.Linear(4 * self.num_units, 2 * self.num_units, bias=False)
+        self.fc2 = nn.Linear(2 * self.num_units, self.num_units, bias=False)
 
         #self.relu = nn.ReLU()
 
@@ -203,17 +209,26 @@ class tNet(nn.Module):
         self.bn4 = nn.BatchNorm1d(2 * self.num_units)
         self.bn5 = nn.BatchNorm1d(self.num_units)
 
-    def forward(self, x):
+    def forward(self, x, index, batch_size=None):
         """
         :param x: [batch, #features, #points]
         :return:
             logit: [batch, embedding_size]
         """
         x = self.input_batch_norm(x)
-        x = self.activation_func(self.bn1(self.conv1(x)))
-        x = self.activation_func(self.bn2(self.conv2(x)))
-        x = self.activation_func(self.bn3(self.conv3(x)))
-        x, _ = torch.max(x, dim=2)  # global max pooling
+        x = self.activation_func(self.bn1(self.lin1(x)))
+        x = self.activation_func(self.bn2(self.lin2(x)))
+        x = self.activation_func(self.bn3(self.lin3(x)))
+
+        if batch_size is None or batch_size <= 0:
+            batch_size = index.max().item()+1
+
+        # batch-wise global maxpooling
+        if is_scatter_available:
+            x, _ = scatter_max(x, index, dim=0, dim_size=batch_size)
+        else:
+            x = [torch.max(x[index==i], dim=0)[0] for i in range(batch_size)]
+            x = torch.stack(x, dim=0)
         assert x.size(1) == 4 * self.num_units
 
         x = self.activation_func(self.bn4(self.fc1(x)))
@@ -341,7 +356,7 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None, points=None, variables=None, tokenizer=None):
+    def forward(self, idx, targets=None, points=None, index=None, variables=None, tokenizer=None):
         b, t = idx.size()
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
@@ -350,7 +365,7 @@ class GPT(nn.Module):
         position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
 
         if points != None and self.pointNet !=None:
-            points_embeddings = self.pointNet(points)
+            points_embeddings = self.pointNet(points, index, b)
 
             if variables != None and self.pointNetConfig.varibleEmbedding =='LEA_EMB':
                 # add the variables information to the point embedding
@@ -413,27 +428,5 @@ class GPT(nn.Module):
 
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), 
                                    ignore_index=self.config.padding_idx)
-
-            #print('\nLogits Max:{}\ntargets:{}\n'.format(logits.max(-1)[1], targets))
-            # eps = 1e-5
-            # # remove the effect of padded indexes
-            # mask = ~(targets==self.config.padding_idx)
-            # logits_masked = logits.max(-1)[1] * mask
-            # targets_masked = targets * mask
-            # loss += 0.001*F.mse_loss(logits_masked+eps, targets_masked+eps)
-
-            # if points != None and self.pointNet !=None:
-            #     recPoints = self.helper(x) # b, (#Ys+#Vars) * #Points
-            #     recPoints, _ = torch.max(recPoints, dim=1)  # global max pooling
-            #     recPoints = recPoints.view(b*self.pointNetConfig.numberofPoints,
-            #                     self.pointNetConfig.numberofVars+self.pointNetConfig.numberofYs)
-            #     targetPoints = points.view(b*self.pointNetConfig.numberofPoints,
-            #                     self.pointNetConfig.numberofVars+self.pointNetConfig.numberofYs) 
-            #     recPoints = self.helper_batch_norm(recPoints)
-            #     targetPoints = self.helper_batch_norm(targetPoints)
-            #     mseLoss = F.mse_loss(recPoints, targetPoints)
-            #     #print('loss,mseLoss:',loss, mseLoss)
-            #     loss += mseLoss
-                
 
         return logits, loss

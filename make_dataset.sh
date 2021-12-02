@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-# ------------------- 1-5 Var -------------------
+# # ------------------- 1-5 Var -------------------
 python dataset.py \
     --config ./configs/dataset_1-5var.json \
     --folder ./datasets/1-5Var_v2/Test/ \
@@ -19,14 +19,17 @@ python dataset.py \
     --force_threshold 0 \
     --numSamples 200
 
+# Note: Original settings (numSamples=10000,numSamplesEachEq=50) should produce
+# 2,500,000 samples (10000*50*5) but due to bugs the actual number was 2,262,058.
+# Now we make 2,000,000 samples to be affordable for 32GB memory.
 python dataset.py \
     --config ./configs/dataset_1-5var.json \
     --folder ./datasets/1-5Var_v2/Train/ \
     --seed 2021 \
     --testPoints 0 \
-    --numSamplesEachEq 50 \
+    --numSamplesEachEq 20 \
     --force_threshold 1 \
-    --numSamples 10000
+    --numSamples 20000
 
 
 # ------------------- 1 Var -------------------
